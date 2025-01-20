@@ -1,6 +1,8 @@
+import asyncio
 import os
 import subprocess
 import sys
+import threading
 from platform import processor, release, system, version
 from signal import SIGINT, signal  # Import the signal module to handle Ctrl+C
 from threading import Thread
@@ -64,6 +66,7 @@ from speech_translate.utils.whisper.download import (
     verify_model_whisper,
 )
 from speech_translate.utils.whisper.helper import append_dot_en, create_hallucination_filter, model_keys
+from speech_translate.websocket_server import set_recording_params, start_websocket_server
 
 
 # monkey patch subprocess.run
@@ -246,7 +249,7 @@ class MainWindow:
             self.splash_img = Image.open(p_splash_image)
             self.splash_img = self.splash_img.resize((640, 360))
         except Exception:
-            self.splash_img = Image.new("RGB", (640, 360), "black")
+            self.splash_img = Image.new("RGB", (640, 360), "black") # type: ignore
 
         self.root.geometry("640x350")
         self.canvas_splash = Canvas(self.root, width=640, height=345, bg="black", highlightthickness=0)
@@ -439,7 +442,7 @@ class MainWindow:
 
         self.btn_config_host_api = ttk.Button(
             self.f3_1_row1,
-            image=bc.wrench_emoji,
+            image=bc.wrench_emoji, # type: ignore
             compound="center",
             width=3,
             command=lambda: popup_menu(self.root, self.menu_host_api),
@@ -578,6 +581,10 @@ class MainWindow:
         self.f3_4_row2.pack(side="top", fill="x")
 
         self.btn_record = ttk.Button(self.f3_4_row1, text="Record", command=self.rec)
+        self.btn_record.pack(side="right", padx=5, pady=5)
+        tk_tooltip(self.btn_record, "Record sound from selected input device and process it according to set task")
+
+        self.btn_record = ttk.Button(self.f3_4_row1, text="Server Record", command=self.server_rec)
         self.btn_record.pack(side="right", padx=5, pady=5)
         tk_tooltip(self.btn_record, "Record sound from selected input device and process it according to set task")
 
@@ -1618,6 +1625,112 @@ class MainWindow:
                     kwargs["enabler"]()
 
     # ------------------ Rec ------------------
+    def server_rec(self):
+        if bc.dl_thread and bc.dl_thread.is_alive():
+            mbox(
+                "Please wait! A model is being downloaded",
+                "A Model is still being downloaded! Please wait until it finishes first!",
+                1,
+            )
+            return
+
+        # if rec widget is disabled, return
+        if "disabled" in self.btn_record.state():
+            return
+
+        is_speaker = "selected" in self.radio_speaker.state()
+        if is_speaker and system() != "Windows":  # double checking. Speaker input is only available on Windows
+            mbox(
+                "Not available",
+                "This feature is only available on Windows."
+                "\n\nIn order to record PC sound from OS other than Windows you will need to create a virtual audio loopback"
+                " to pass the speaker output as an input. You can use software like PulseAudio or Blackhole to do this."
+                "\n\nAfter that you can change your default input device to the virtual audio loopback.",
+                0,
+                self.root,
+            )
+            return
+
+        # Checking args
+        tc, tl, m_key, tl_engine, source, target, mic, speaker = self.get_args()
+        if source == target and tl:
+            mbox("Invalid options!", "Source and target language cannot be the same", 2)
+            return
+
+        # check model first
+        tl_whisper = tl_engine in model_keys
+        model_tc = None
+        m_check_kwargs = {"disabler": self.disable_interactions, "enabler": self.enable_interactions}
+
+        if (tl and not tl_whisper) or tc:  # check tc model if tc or tl only but not whisper
+            status, model_tc = self.check_model(m_key, source == "english", "recording", self.rec, **m_check_kwargs)
+            if not status:
+                return
+
+        if tl and tl_whisper:  # if tl and using whisper engine, check model
+            status, tl_engine = self.check_model(tl_engine, source == "english", "recording", self.rec, **m_check_kwargs)
+            if not status:
+                return
+
+        # if only tl and using whisper, replace model_tc with engine
+        if tl and not tc and tl_whisper:
+            model_tc = tl_engine
+
+        assert model_tc is not None, (
+            "model_tc is not set, this should not happened. " \
+            "Report this as a bug at https://github.com/Dadangdut33/Speech-Translate/issues"
+        )
+
+        set_recording_params(
+            lang_source=source,
+            lang_target=target,
+            engine=tl_engine,
+            model_name_tc=model_tc,
+            device=mic if not is_speaker else speaker,
+            is_tc=tc,
+            is_tl=tl,
+            speaker=is_speaker
+        )
+        # check when using libre
+        if tl and tl_engine == "LibreTranslate":
+            # check wether the link is set or not
+            if sj.cache["libre_link"].strip() == "":
+                mbox(
+                    "LibreTranslate host/URL is not set!",
+                    "LibreTranslate host/URL is not set! Please set it first in the settings!",
+                    2,
+                )
+                return False
+
+            # check api key
+            if not sj.cache["supress_libre_api_key_warning"] and sj.cache["libre_api_key"].strip() == "":
+                if not mbox(
+                    "LibreTranslate API key is not set!",
+                    "WARNING!! LibreTranslate API key is not set! Do you want to continue anyway?",
+                    3,
+                    self.root,
+                ):
+                    return False
+
+        # ui changes
+        self.tb_clear()
+        self.start_lb()
+        self.disable_interactions()
+        self.btn_record.configure(text="Loading", command=self.rec_stop, state="normal")
+
+        bc.enable_rec()  # Flag update    # Disable recording is by button input
+
+        # Start thread
+        try:
+            websocket_thread = threading.Thread(target=asyncio.run, args=(start_websocket_server(),), daemon=True)
+            websocket_thread.start()
+            print("WebSocket server started")
+        except Exception as e:
+            logger.exception(e)
+            self.error_notif(str(e))
+            self.rec_stop()
+            self.after_rec_stop()
+
     def rec(self):
         if bc.dl_thread and bc.dl_thread.is_alive():
             mbox(
